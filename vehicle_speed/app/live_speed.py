@@ -4,62 +4,10 @@ import yaml
 import cv2
 import numpy as np
 import os
+import torch
 from ultralytics import YOLO
 
-try:
-    from filterpy.kalman import KalmanFilter
-    HAVE_FILTERPY = True
-except Exception:
-    HAVE_FILTERPY = False
-
-# Simple IOU-based tracker fallback
-class SimpleTracker:
-    def __init__(self, iou_threshold=0.3, max_age=30):
-        self.iou_threshold = iou_threshold
-        self.max_age = max_age
-        self.tracks = {}
-        self.next_id = 1
-
-    def iou(self, a, b):
-        x1 = max(a[0], b[0])
-        y1 = max(a[1], b[1])
-        x2 = min(a[2], b[2])
-        y2 = min(a[3], b[3])
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        area_a = (a[2]-a[0])*(a[3]-a[1])
-        area_b = (b[2]-b[0])*(b[3]-b[1])
-        union = area_a + area_b - inter + 1e-6
-        return inter / union
-
-    def update(self, detections):
-        updated_tracks = {}
-        used = set()
-        # Match existing tracks to detections
-        for tid, t in self.tracks.items():
-            best_iou = 0
-            best_j = -1
-            for j, det in enumerate(detections):
-                if j in used:
-                    continue
-                i = self.iou(t['bbox'], det)
-                if i > best_iou:
-                    best_iou = i
-                    best_j = j
-            if best_iou >= self.iou_threshold and best_j >= 0:
-                updated_tracks[tid] = {'bbox': detections[best_j], 'age': 0}
-                used.add(best_j)
-            else:
-                t['age'] += 1
-                if t['age'] <= self.max_age:
-                    updated_tracks[tid] = t
-        # Create new tracks
-        for j, det in enumerate(detections):
-            if j in used:
-                continue
-            updated_tracks[self.next_id] = {'bbox': det, 'age': 0}
-            self.next_id += 1
-        self.tracks = updated_tracks
-        return self.tracks
+# ByteTrack is handled by Ultralytics internally via tracker='bytetrack.yaml'
 
 
 def load_calibration(calib_path):
@@ -96,6 +44,20 @@ def speed_kmh_from_tracks(id_to_history, fps, scale_m_per_px=1.0):
     return id_to_speed
 
 
+def load_regressor(path):
+    if not path:
+        return None, None, None
+    ckpt = torch.load(path, map_location='cpu')
+    model = torch.nn.Sequential(
+        torch.nn.Linear(3, 64), torch.nn.ReLU(),
+        torch.nn.Linear(64, 64), torch.nn.ReLU(),
+        torch.nn.Linear(64, 1)
+    )
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+    return model, ckpt['x_mean'], ckpt['x_std']
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=str, default='0', help='camera index or video path')
@@ -107,6 +69,7 @@ def main():
     parser.add_argument('--save_vid', action='store_true')
     parser.add_argument('--use_h', action='store_true', help='use homography instead of VP/scale')
     parser.add_argument('--fps', type=float, default=30.0)
+    parser.add_argument('--reg', type=str, default='', help='path to trained speed regressor .pt to refine v_geom')
     args = parser.parse_args()
 
     # Video source
@@ -121,11 +84,8 @@ def main():
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     Hc = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Model
+    # Model with ByteTrack
     model = YOLO(args.weights)
-
-    # Tracker
-    tracker = SimpleTracker()
 
     # Calibration
     calib = load_calibration(args.calib)
@@ -142,6 +102,10 @@ def main():
 
     # History for speed
     id_to_history = {}
+    id_to_bbox_heights = {}
+
+    # Optional regressor
+    reg_model, x_mean, x_std = load_regressor(args.reg)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -154,37 +118,64 @@ def main():
         if not ok:
             break
 
-        yres = model.predict(frame, conf=args.conf, verbose=False)[0]
+        # ByteTrack tracking via Ultralytics
+        res = model.track(frame, conf=args.conf, verbose=False, persist=True, tracker='bytetrack.yaml')[0]
         dets = []
-        for b, c in zip(yres.boxes.xyxy.cpu().numpy(), yres.boxes.cls.cpu().numpy().astype(int)):
-            if args.classes and c not in args.classes:
-                continue
-            dets.append(b)
+        ids = []
+        if res.boxes is not None and res.boxes.id is not None:
+            boxes = res.boxes.xyxy.cpu().numpy()
+            clses = res.boxes.cls.cpu().numpy().astype(int)
+            tids = res.boxes.id.cpu().numpy().astype(int)
+            for b, c, tid in zip(boxes, clses, tids):
+                if args.classes and c not in args.classes:
+                    continue
+                dets.append(b)
+                ids.append(tid)
 
-        tracks = tracker.update(dets)
+        frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
         # update histories and compute world coords
-        for tid, t in tracks.items():
-            bc = bottom_center(t['bbox'])
+        for b, tid in zip(dets, ids):
+            bc = bottom_center(b)
             if tid not in id_to_history:
                 id_to_history[tid] = []
+                id_to_bbox_heights[tid] = []
             if H_mat is not None:
                 world_xy = apply_homography(H_mat, bc.reshape(1, 2)).reshape(-1)
             else:
                 world_xy = bc  # assume near-planar, scaled in pixels
-            id_to_history[tid].append({'frame': int(cap.get(cv2.CAP_PROP_POS_FRAMES)), 'world': world_xy})
+            id_to_history[tid].append({'frame': frame_num, 'world': world_xy})
+            id_to_bbox_heights[tid].append(float(b[3] - b[1]))
             # keep recent history
-            if len(id_to_history[tid]) > 30:
-                id_to_history[tid] = id_to_history[tid][-30:]
+            if len(id_to_history[tid]) > 60:
+                id_to_history[tid] = id_to_history[tid][-60:]
+                id_to_bbox_heights[tid] = id_to_bbox_heights[tid][-60:]
 
-        id_to_speed = speed_kmh_from_tracks(id_to_history, fps=fps, scale_m_per_px=scale_m_per_px)
+        id_to_speed_geom = speed_kmh_from_tracks(id_to_history, fps=fps, scale_m_per_px=scale_m_per_px)
+
+        # If regressor is provided, refine speeds
+        id_to_speed = {}
+        for tid, v_geom in id_to_speed_geom.items():
+            if reg_model is None:
+                id_to_speed[tid] = v_geom
+                continue
+            h_med = float(np.median(id_to_bbox_heights.get(tid, [0.0])))
+            track_len = len(id_to_history.get(tid, []))
+            x = np.array([[v_geom, h_med, track_len]], dtype=np.float32)
+            xn = (x - x_mean) / (x_std + 1e-6)
+            with torch.no_grad():
+                dv = float(reg_model(torch.from_numpy(xn)).cpu().numpy().reshape(-1)[0])
+            id_to_speed[tid] = max(0.0, v_geom + dv)
 
         # Draw
-        for tid, t in tracks.items():
-            x1, y1, x2, y2 = map(int, t['bbox'])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            v = id_to_speed.get(tid, 0.0)
-            cv2.putText(frame, f'ID {tid} {v:.1f} km/h', (x1, max(20, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+        if res.boxes is not None and res.boxes.id is not None:
+            for b, c, tid in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.cls.cpu().numpy().astype(int), res.boxes.id.cpu().numpy().astype(int)):
+                if args.classes and c not in args.classes:
+                    continue
+                x1, y1, x2, y2 = map(int, b)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                v = id_to_speed.get(int(tid), 0.0)
+                cv2.putText(frame, f'ID {int(tid)} {v:.1f} km/h', (x1, max(20, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
 
         if args.display:
             cv2.imshow('live_speed', frame)
