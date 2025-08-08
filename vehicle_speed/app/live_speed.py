@@ -61,7 +61,7 @@ def load_regressor(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=str, default='0', help='camera index or video path')
-    parser.add_argument('--weights', type=str, default='yolov8n.pt')
+    parser.add_argument('--weights', type=str, default='yolo11m.pt')
     parser.add_argument('--calib', type=str, required=True)
     parser.add_argument('--conf', type=float, default=0.3)
     parser.add_argument('--classes', type=int, nargs='*', default=[2, 3, 5, 7])  # car, motorbike, bus, truck
